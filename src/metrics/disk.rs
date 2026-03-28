@@ -3,9 +3,6 @@
  */
 
 use crate::util::percent_of;
-use futures::StreamExt;
-use heim::disk::{io_counters, IoCounters};
-use heim::units::information::byte;
 use std::collections::HashMap;
 use std::ffi::OsStr;
 use std::fs::{canonicalize, read_link};
@@ -20,14 +17,7 @@ pub struct IoMetrics {
     pub write_bytes: u64,
 }
 
-impl IoMetrics {
-    pub fn from_io_counters(io_counters: &IoCounters) -> IoMetrics {
-        IoMetrics {
-            read_bytes: io_counters.read_bytes().get::<byte>(),
-            write_bytes: io_counters.write_bytes().get::<byte>(),
-        }
-    }
-}
+
 
 impl ops::Add for IoMetrics {
     type Output = IoMetrics;
@@ -148,28 +138,8 @@ pub fn get_device_name(dev: &OsStr) -> String {
     }
 }
 
-pub async fn get_disk_io_metrics(disks: &mut HashMap<String, ZDisk>) {
-    let io_counters_fut = io_counters().await;
-
-    if let Ok(io_counter_stream) = io_counters_fut {
-        ::futures::pin_mut!(io_counter_stream);
-        while let Some(i) = io_counter_stream.next().await {
-            if let Ok(i) = i {
-                let name = i.device_name().to_string_lossy().to_string();
-                debug!("Name: {:}", name);
-                if let Some(d) = disks.get_mut(&format!("/dev/{name:}")) {
-                    let io_metrics = IoMetrics::from_io_counters(&i);
-                    d.previous_io = d.current_io;
-                    d.current_io = io_metrics;
-                    if d.previous_io.write_bytes == 0 && d.previous_io.read_bytes == 0 {
-                        d.previous_io.write_bytes = d.current_io.write_bytes;
-                        d.previous_io.read_bytes = d.current_io.read_bytes;
-                    }
-                    debug!("{:?}", d);
-                }
-            } else {
-                debug!("Couldn't get counters for a disk, skipping.")
-            }
-        }
-    }
+pub async fn get_disk_io_metrics(_disks: &mut HashMap<String, ZDisk>) {
+    // Disk IO counters were previously obtained via heim.
+    // On non-Linux, IO is already tracked per-process via sysinfo.
+    // On Linux, this could be reimplemented by reading /proc/diskstats.
 }

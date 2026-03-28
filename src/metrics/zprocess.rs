@@ -3,11 +3,10 @@
  */
 
 use crate::metrics::ProcessTableSortBy;
-use heim::process;
-use heim::process::ProcessError;
 
 #[cfg(target_os = "macos")]
 use libc::{c_int, c_void, pid_t};
+#[cfg(unix)]
 use libc::{getpriority, id_t, setpriority};
 
 #[cfg(target_os = "linux")]
@@ -18,7 +17,6 @@ use procfs;
 use std::cmp::Ordering;
 #[cfg(target_os = "linux")]
 use std::cmp::Ordering::Equal;
-use std::convert::TryInto;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use sysinfo::Process;
 use sysinfo::ProcessStatus;
@@ -27,25 +25,7 @@ use chrono::prelude::DateTime;
 use chrono::Duration as CDuration;
 use chrono::Local;
 
-macro_rules! convert_result_to_string {
-    ($x:expr) => {
-        match $x {
-            Ok(_r) => String::from("Signal Sent."),
-            Err(e) => convert_error_to_string!(e),
-        }
-    };
-}
 
-macro_rules! convert_error_to_string {
-    ($x:expr) => {
-        match $x {
-            ProcessError::NoSuchProcess { .. } => String::from("No Such Process"),
-            ProcessError::ZombieProcess { .. } => String::from("Zombie Process"),
-            ProcessError::AccessDenied { .. } => String::from("Access Denied"),
-            _ => String::from("Unknown error"),
-        }
-    };
-}
 
 #[cfg(target_os = "macos")]
 const PROC_PIDTASKINFO: c_int = 4;
@@ -186,12 +166,22 @@ pub fn set_addl_task_info(zprocess: &mut ZProcess) {
     }
 }
 
+#[cfg(target_os = "windows")]
+pub fn set_addl_task_info(_zprocess: &mut ZProcess) {
+    // Thread count and priority info not yet implemented for Windows
+}
+
 impl ZProcess {
     pub fn from_user_and_process(user_name: String, process: &Process) -> Self {
         let disk_usage = process.disk_usage();
 
         let mut zp = ZProcess {
-            uid: process.user_id().map(|uid| **uid).unwrap_or(0),
+            uid: {
+                #[cfg(unix)]
+                { process.user_id().map(|uid| **uid).unwrap_or(0) }
+                #[cfg(not(unix))]
+                { 0 }
+            },
             user_name,
             pid: process.pid().as_u32(),
             memory: process.memory(),
@@ -248,48 +238,48 @@ impl ZProcess {
         (self.write_bytes - self.prev_write_bytes) as f64 / tick_rate.as_secs_f64()
     }
 
+    #[cfg(unix)]
     pub async fn suspend(&self) -> String {
-        let pid_i32: i32 = match self.pid.try_into() {
-            Ok(val) => val,
-            Err(_) => return "PID value too large to convert to i32".to_string(),
-        };
-        match process::get(pid_i32).await {
-            Ok(p) => convert_result_to_string!(p.suspend().await),
-            Err(e) => convert_error_to_string!(e),
-        }
+        let result = unsafe { libc::kill(self.pid as i32, libc::SIGSTOP) };
+        if result == 0 { "Signal Sent.".into() } else { "Failed to suspend process.".into() }
     }
 
+    #[cfg(target_os = "windows")]
+    pub async fn suspend(&self) -> String {
+        "Suspend not supported on Windows.".into()
+    }
+
+    #[cfg(unix)]
     pub async fn resume(&self) -> String {
-        let pid_i32: i32 = match self.pid.try_into() {
-            Ok(val) => val,
-            Err(_) => return "PID value too large to convert to i32".to_string(),
-        };
-        match process::get(pid_i32).await {
-            Ok(p) => convert_result_to_string!(p.resume().await),
-            Err(e) => convert_error_to_string!(e),
-        }
+        let result = unsafe { libc::kill(self.pid as i32, libc::SIGCONT) };
+        if result == 0 { "Signal Sent.".into() } else { "Failed to resume process.".into() }
     }
 
+    #[cfg(target_os = "windows")]
+    pub async fn resume(&self) -> String {
+        "Resume not supported on Windows.".into()
+    }
+
+    #[cfg(unix)]
     pub async fn kill(&self) -> String {
-        let pid_i32: i32 = match self.pid.try_into() {
-            Ok(val) => val,
-            Err(_) => return "PID value too large to convert to i32".to_string(),
-        };
-        match process::get(pid_i32).await {
-            Ok(p) => convert_result_to_string!(p.kill().await),
-            Err(e) => convert_error_to_string!(e),
-        }
+        let result = unsafe { libc::kill(self.pid as i32, libc::SIGKILL) };
+        if result == 0 { "Signal Sent.".into() } else { "Failed to kill process.".into() }
     }
 
+    #[cfg(target_os = "windows")]
+    pub async fn kill(&self) -> String {
+        win_terminate_process(self.pid)
+    }
+
+    #[cfg(unix)]
     pub async fn terminate(&self) -> String {
-        let pid_i32: i32 = match self.pid.try_into() {
-            Ok(val) => val,
-            Err(_) => return "PID value too large to convert to i32".to_string(),
-        };
-        match process::get(pid_i32).await {
-            Ok(p) => convert_result_to_string!(p.terminate().await),
-            Err(e) => convert_error_to_string!(e),
-        }
+        let result = unsafe { libc::kill(self.pid as i32, libc::SIGTERM) };
+        if result == 0 { "Signal Sent.".into() } else { "Failed to terminate process.".into() }
+    }
+
+    #[cfg(target_os = "windows")]
+    pub async fn terminate(&self) -> String {
+        win_terminate_process(self.pid)
     }
 
     pub fn nice(&mut self) -> String {
@@ -383,6 +373,11 @@ impl ZProcess {
         } else {
             String::from("Priority Set.")
         }
+    }
+
+    #[cfg(target_os = "windows")]
+    pub fn set_priority(&mut self, _priority: i32) -> String {
+        String::from("Set priority not supported on Windows.")
     }
 
     pub fn set_end_time(&mut self) {
@@ -539,6 +534,29 @@ impl ZProcess {
     }
 }
 
+#[cfg(target_os = "windows")]
+fn win_terminate_process(pid: u32) -> String {
+    extern "system" {
+        fn OpenProcess(desired_access: u32, inherit_handles: i32, process_id: u32) -> *mut std::ffi::c_void;
+        fn TerminateProcess(process: *mut std::ffi::c_void, exit_code: u32) -> i32;
+        fn CloseHandle(object: *mut std::ffi::c_void) -> i32;
+    }
+    const PROCESS_TERMINATE: u32 = 0x0001;
+    unsafe {
+        let handle = OpenProcess(PROCESS_TERMINATE, 0, pid);
+        if handle.is_null() {
+            return "Access Denied or No Such Process.".into();
+        }
+        let result = TerminateProcess(handle, 1);
+        CloseHandle(handle);
+        if result != 0 {
+            "Process Terminated.".into()
+        } else {
+            "Failed to terminate process.".into()
+        }
+    }
+}
+
 pub trait ProcessStatusExt {
     fn to_single_char(&self) -> &str;
 }
@@ -558,6 +576,7 @@ impl ProcessStatusExt for ProcessStatus {
             ProcessStatus::Parked => "P",
             ProcessStatus::UninterruptibleDiskSleep => "D",
             ProcessStatus::LockBlocked => "L",
+            ProcessStatus::Suspended => "T",
             ProcessStatus::Unknown(_) => "U",
         }
     }

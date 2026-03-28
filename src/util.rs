@@ -5,7 +5,9 @@
 
 use crate::constants::DEFAULT_TICK;
 use crossterm::{event, event::Event as CEvent, event::KeyCode as Key, event::KeyEvent};
+#[cfg(unix)]
 use signal_hook::consts::signal::{SIGABRT, SIGINT, SIGTERM};
+#[cfg(unix)]
 use signal_hook::iterator::Signals;
 use std::fs::{remove_file, File};
 use std::io::Write;
@@ -27,6 +29,7 @@ pub struct Events {
     rx: mpsc::Receiver<Event<KeyEvent>>,
     input_handle: thread::JoinHandle<()>,
     tick_handle: thread::JoinHandle<()>,
+    #[cfg(unix)]
     sig_handle: thread::JoinHandle<()>,
 }
 
@@ -82,6 +85,7 @@ impl Events {
                 }
             })
         };
+        #[cfg(unix)]
         let sig_handle = {
             let tx = tx;
             let mut signals =
@@ -94,10 +98,14 @@ impl Events {
                 }
             })
         };
+        // On Windows, Ctrl+C is handled via crossterm key events (Ctrl+C -> KeyCode::Char('c'))
+        #[cfg(not(unix))]
+        drop(tx);
         Events {
             rx,
             input_handle,
             tick_handle,
+            #[cfg(unix)]
             sig_handle,
         }
     }
@@ -156,9 +164,13 @@ async fn is_zenith_running(path: &Path) -> bool {
 
 async fn name_of_process_for_pidfile(path: &Path) -> Option<String> {
     let data = std::fs::read_to_string(path).ok()?;
-    let pid: i32 = data.parse().ok()?;
-    let process = heim::process::get(pid).await.ok()?;
-    process.name().await.ok()
+    let pid: u32 = data.trim().parse().ok()?;
+    let sys = sysinfo::System::new_with_specifics(
+        sysinfo::RefreshKind::nothing().with_processes(sysinfo::ProcessRefreshKind::nothing()),
+    );
+    let sysinfo_pid = sysinfo::Pid::from_u32(pid);
+    let process = sys.process(sysinfo_pid)?;
+    Some(process.name().to_string_lossy().to_string())
 }
 
 pub fn percent_of(numerator: u64, denominator: u64) -> f32 {

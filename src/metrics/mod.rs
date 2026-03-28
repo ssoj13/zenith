@@ -18,12 +18,6 @@ use crate::metrics::zprocess::set_addl_task_info;
 use crate::metrics::zprocess::ZProcess;
 use crate::util::percent_of;
 
-use futures::StreamExt;
-use heim::host;
-use heim::net;
-use heim::net::Address;
-use heim::units::frequency::megahertz;
-use heim::units::time;
 use std::collections::{HashMap, HashSet};
 use std::time::{Duration, SystemTime};
 
@@ -38,7 +32,23 @@ use nvml::{cuda_driver_version_major, cuda_driver_version_minor};
 use std::fs;
 use std::path::{Path, PathBuf};
 use sysinfo::{Component, Components, Disk, Disks, Networks, System};
+#[cfg(unix)]
 use uzers::{Users, UsersCache};
+
+#[cfg(unix)]
+fn get_user_name(process: &sysinfo::Process, cache: &UsersCache) -> String {
+    let uid = process.user_id().map(|uid| **uid).unwrap_or(0);
+    cache
+        .get_user_by_uid(uid)
+        .map(|user| user.name().to_string_lossy().to_string())
+        .unwrap_or_else(|| format!("{}", uid))
+}
+
+#[cfg(not(unix))]
+fn get_user_name(process: &sysinfo::Process, _cache: &()) -> String {
+    // On Windows, sysinfo user_id returns Sid; just show "unknown"
+    format!("{}", process.pid())
+}
 
 #[cfg(all(feature = "nvidia", not(target_os = "linux")))]
 #[derive(FromPrimitive, PartialEq, Copy, Clone)]
@@ -244,7 +254,10 @@ pub struct CPUTimeApp {
     pub net_out: u64,
     pub processes: Vec<u32>,
     pub process_map: HashMap<u32, ZProcess>,
+    #[cfg(unix)]
     pub user_cache: UsersCache,
+    #[cfg(not(unix))]
+    pub user_cache: (),
     pub cum_cpu_process: Option<ZProcess>,
     pub top_pids: Top,
     pub frequency: u64,
@@ -334,7 +347,10 @@ impl CPUTimeApp {
             net_out: 0,
             processes: Vec::with_capacity(400),
             process_map: HashMap::with_capacity(400),
+            #[cfg(unix)]
             user_cache: UsersCache::new(),
+            #[cfg(not(unix))]
+            user_cache: (),
             cum_cpu_process: None,
             frequency: 0,
             threads_total: 0,
@@ -385,28 +401,18 @@ impl CPUTimeApp {
 
     async fn get_platform(&mut self) {
         debug!("Updating Platform");
-        match host::platform().await {
-            Ok(p) => {
-                self.osname = p.system().to_owned();
-                self.arch = p.architecture().as_str().to_owned();
-                self.hostname = p.hostname().to_owned();
-                self.version = p.version().to_owned();
-                self.release = p.release().to_owned();
-            }
-            Err(_) => {
-                self.osname = String::from("unknown");
-                self.arch = String::from("unknown");
-                self.hostname = String::from("unknown");
-                self.version = String::from("unknown");
-                self.release = String::from("unknown");
-            }
+        self.osname = System::name().unwrap_or_else(|| "unknown".into());
+        self.hostname = System::host_name().unwrap_or_else(|| "unknown".into());
+        self.version = System::os_version().unwrap_or_else(|| "unknown".into());
+        self.release = System::kernel_version().unwrap_or_else(|| "unknown".into());
+        self.arch = {
+            let a = System::cpu_arch();
+            if a.is_empty() { "unknown".into() } else { a }
         };
     }
 
     async fn get_uptime(&mut self) {
-        if let Ok(u) = host::uptime().await {
-            self.uptime = Duration::from_secs_f64(u.get::<time::second>());
-        }
+        self.uptime = Duration::from_secs(System::uptime());
     }
 
     fn get_batteries(&mut self) {
@@ -421,49 +427,15 @@ impl CPUTimeApp {
 
     async fn get_nics(&mut self) {
         debug!("Updating Network Interfaces");
+        // NIC IP enumeration removed (was heim-dependent)
+        // Network throughput metrics still work via sysinfo::Networks
         self.network_interfaces.clear();
-        let nics = net::nic().await;
-        let nics = match nics {
-            Ok(nics) => nics,
-            Err(_) => {
-                debug!("Couldn't get nic information");
-                return;
-            }
-        };
-        ::futures::pin_mut!(nics);
-        while let Some(n) = nics.next().await {
-            match n {
-                Ok(n) => {
-                    if !n.is_up() || n.is_loopback() {
-                        continue;
-                    }
-                    if n.name().starts_with("utun")
-                        || n.name().starts_with("awd")
-                        || n.name().starts_with("ham")
-                    {
-                        continue;
-                    }
-                    let ip = match n.address() {
-                        Address::Inet(n) => n.to_string(),
-                        _ => String::new(),
-                    }
-                    .trim_end_matches(":0")
-                    .to_string();
-                    if ip.is_empty() {
-                        continue;
-                    }
-                    let dest = match n.destination() {
-                        Some(Address::Inet(d)) => d.to_string(),
-                        _ => String::new(),
-                    };
-                    self.network_interfaces.push(NetworkInterface {
-                        name: n.name().to_owned(),
-                        ip,
-                        dest,
-                    });
-                }
-                Err(_) => println!("Couldn't get information on a nic"),
-            }
+        for (name, _data) in self.networks.iter() {
+            self.network_interfaces.push(NetworkInterface {
+                name: name.to_string(),
+                ip: String::new(),
+                dest: String::new(),
+            });
         }
     }
 
@@ -525,12 +497,7 @@ impl CPUTimeApp {
 
                     top.update(zp, &self.histogram_map.tick);
                 } else {
-                    let uid = process.user_id().map(|uid| **uid).unwrap_or(0);
-                    let user_name = self
-                        .user_cache
-                        .get_user_by_uid(uid)
-                        .map(|user| user.name().to_string_lossy().to_string())
-                        .unwrap_or(format!("{:}", uid));
+                    let user_name = get_user_name(process, &self.user_cache);
                     let zprocess = ZProcess::from_user_and_process(user_name, process);
                     self.threads_total += zprocess.threads_total as usize;
 
@@ -539,12 +506,7 @@ impl CPUTimeApp {
                     self.process_map.insert(zprocess.pid, zprocess);
                 }
             } else {
-                let uid = process.user_id().map(|uid| **uid).unwrap_or(0);
-                let user_name = self
-                    .user_cache
-                    .get_user_by_uid(uid)
-                    .map(|user| user.name().to_string_lossy().to_string())
-                    .unwrap_or(format!("{:}", uid));
+                let user_name = get_user_name(process, &self.user_cache);
                 #[allow(unused_mut)]
                 let mut zprocess = ZProcess::from_user_and_process(user_name, process);
                 #[cfg(target_os = "linux")]
@@ -623,9 +585,8 @@ impl CPUTimeApp {
 
     async fn update_frequency(&mut self) {
         debug!("Updating Frequency");
-        let f = heim::cpu::frequency().await;
-        if let Ok(f) = f {
-            self.frequency = f.current().get::<megahertz>();
+        if let Some(cpu) = self.system.cpus().first() {
+            self.frequency = cpu.frequency();
         }
     }
 
